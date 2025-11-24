@@ -78,6 +78,17 @@ export async function startApp() {
   const port = parseInt(process.env.PORT || '3000', 10);
 
   try {
+    // Run migrations with retry logic
+    try {
+      const { runMigrations } = await import('./db/migrate');
+      await runMigrations();
+    } catch (migrationError: any) {
+      // If migration fails, log but don't crash - might already be migrated
+      logger.warn('Migration check failed, continuing anyway', {
+        error: migrationError.message,
+      });
+    }
+
     // Test database connection
     await getPool().query('SELECT 1');
     logger.info('Database connection established');

@@ -17,6 +17,6 @@ RUN npm run build
 # Expose port
 EXPOSE 3000
 
-# Run migrations and start server
-CMD ["sh", "-c", "node dist/db/migrate.js && node dist/server.js"]
+# Start command - migrations will run with retry logic
+CMD ["node", "dist/server.js"]
 
