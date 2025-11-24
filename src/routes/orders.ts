@@ -1,5 +1,5 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { SocketStream } from '@fastify/websocket';
+import WebSocket from 'ws';
 import { CreateOrderSchema, CreateOrderRequest } from '../models/order';
 import { createOrder, getOrderById } from '../db';
 import { orderQueue } from '../queue/orderQueue';
@@ -42,31 +42,12 @@ export async function executeOrderRoute(
     // Add job to queue
     await orderQueue.add('execute-order', { orderId: order.id });
 
-    // Check if client wants WebSocket upgrade
-    const upgradeHeader = request.headers.upgrade;
-    if (upgradeHeader && upgradeHeader.toLowerCase() === 'websocket') {
-      // Upgrade to WebSocket
-      return reply.raw.upgrade(
-        {
-          orderId: order.id,
-        },
-        request.raw,
-        request.headers,
-        (error) => {
-          if (error) {
-            logger.error('WebSocket upgrade failed', {
-              orderId: order.id,
-              error: error.message,
-            });
-          }
-        }
-      );
-    }
-
     // Return HTTP response
+    // Client should connect to /ws?orderId=<orderId> for WebSocket updates
     return reply.send({
       orderId: order.id,
       message: 'Order accepted. Connect to WebSocket for live updates.',
+      wsUrl: `/ws?orderId=${order.id}`,
     });
   } catch (error: any) {
     logger.error('Order execution failed', { error: error.message });
@@ -115,16 +96,16 @@ export async function getOrderRoute(
  * WebSocket endpoint handler
  */
 export async function orderWebSocketHandler(
-  connection: SocketStream,
-  request: FastifyRequest
+  socket: WebSocket,
+  request: FastifyRequest<{ Querystring: { orderId?: string } }>
 ) {
-  const orderId = (request as any).upgradeData?.orderId || request.query?.orderId;
+  const orderId = request.query?.orderId;
 
   if (!orderId || typeof orderId !== 'string') {
-    connection.socket.close(1008, 'Missing orderId');
+    socket.close(1008, 'Missing orderId');
     return;
   }
 
-  await handleOrderWebSocket(connection, orderId);
+  await handleOrderWebSocket(socket, orderId);
 }
 

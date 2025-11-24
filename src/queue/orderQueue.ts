@@ -43,6 +43,8 @@ export const orderWorker = new Worker<{ orderId: string }>(
   'order-execution',
   async (job: Job<{ orderId: string }>) => {
     const { orderId } = job.data;
+    // wait 20s before processing
+    // await new Promise((resolve) => setTimeout(resolve, 20000));
     logger.info('Processing order', { orderId, attempt: job.attemptsMade + 1 });
 
     // Rate limiting

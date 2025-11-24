@@ -1,5 +1,10 @@
 import fastify from 'fastify';
 import fastifyWebsocket from '@fastify/websocket';
+import fastifyStatic from '@fastify/static';
+import { createBullBoard } from '@bull-board/api';
+import { BullMQAdapter } from '@bull-board/api/bullMQAdapter';
+import { FastifyAdapter } from '@bull-board/fastify';
+import path from 'path';
 import { logger } from './utils/logger';
 import { getPool, closePool } from './db';
 import { orderQueue, closeQueue } from './queue/orderQueue';
@@ -12,6 +17,27 @@ export async function buildApp() {
 
   // Register WebSocket plugin
   await app.register(fastifyWebsocket);
+
+  // Serve static files (for WebSocket test page) - register BEFORE BullMQ UI
+  await app.register(fastifyStatic, {
+    root: path.join(process.cwd(), 'public'),
+    prefix: '/',
+  });
+
+  // BullMQ UI - register with prefix to match base path
+  const serverAdapter = new FastifyAdapter();
+  serverAdapter.setBasePath('/admin/queues');
+
+  createBullBoard({
+    queues: [new BullMQAdapter(orderQueue)],
+    serverAdapter,
+  });
+
+  await app.register(serverAdapter.registerPlugin(), {
+    prefix: '/admin/queues',
+  });
+
+  logger.info('BullMQ UI available at http://localhost:3000/admin/queues');
 
   // Health check
   app.get('/health', async (request, reply) => {
@@ -39,8 +65,8 @@ export async function buildApp() {
   app.post('/api/orders/execute', executeOrderRoute);
   app.get('/api/orders/:id', getOrderRoute);
 
-  // WebSocket endpoint
-  app.register(async function (fastify) {
+  // WebSocket endpoint - register in a separate scope
+  await app.register(async function (fastify) {
     fastify.get('/ws', { websocket: true }, orderWebSocketHandler);
   });
 

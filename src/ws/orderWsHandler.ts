@@ -1,4 +1,4 @@
-import { SocketStream } from '@fastify/websocket';
+import WebSocket from 'ws';
 import IORedis from 'ioredis';
 import { logger } from '../utils/logger';
 import { OrderUpdateMessage } from '../models/order';
@@ -9,10 +9,9 @@ const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
  * Handle WebSocket connection for order updates
  */
 export async function handleOrderWebSocket(
-  connection: SocketStream,
+  socket: WebSocket,
   orderId: string
 ): Promise<void> {
-  const { socket } = connection;
 
   logger.info('WebSocket connection opened', { orderId });
 
@@ -28,10 +27,11 @@ export async function handleOrderWebSocket(
       const update: OrderUpdateMessage = JSON.parse(message);
       socket.send(JSON.stringify(update));
       logger.debug('Sent WebSocket update', { orderId, status: update.status });
-    } catch (error: any) {
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
       logger.error('Failed to parse WebSocket message', {
         orderId,
-        error: error.message,
+        error: errorMessage,
       });
     }
   });
@@ -42,7 +42,7 @@ export async function handleOrderWebSocket(
     subscriber.quit();
   });
 
-  socket.on('error', (error) => {
+  socket.on('error', (error: Error) => {
     logger.error('WebSocket error', { orderId, error: error.message });
     subscriber.unsubscribe(`order:${orderId}`);
     subscriber.quit();

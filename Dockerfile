@@ -6,14 +6,13 @@ WORKDIR /app
 COPY package.json package-lock.json* pnpm-lock.yaml* ./
 
 # Install dependencies
-RUN npm install -g pnpm && \
-    pnpm install --frozen-lockfile || npm install
+RUN npm install
 
 # Copy source code
 COPY . .
 
 # Build TypeScript
-RUN pnpm run build || npm run build
+RUN npm run build
 
 # Expose port
 EXPOSE 3000
