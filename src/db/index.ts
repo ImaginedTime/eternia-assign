@@ -16,9 +16,9 @@ export function getPool(): Pool {
       max: 20,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 2000,
-      // 👇 ADD THIS SSL CONFIGURATION 👇
+      // ✅ SSL CONFIGURATION FOR HOSTED DATABASES
       ssl: {
-        rejectUnauthorized: false, 
+        rejectUnauthorized: false, // Accept self-signed certificates
       },
     });
 
@@ -181,4 +181,3 @@ export async function updateOrderStatus(
     client.release();
   }
 }
-

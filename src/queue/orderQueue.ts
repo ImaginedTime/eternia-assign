@@ -14,18 +14,29 @@ const ORDER_PROCESSOR_RATE = parseInt(process.env.ORDER_PROCESSOR_RATE || '100',
 const RATE_LIMIT_MS = 60000 / ORDER_PROCESSOR_RATE;
 let lastProcessedTime = 0;
 
-// 🔐 secure redis connection (TLS required for Aiven)
-function redisTLS() {
-  return new IORedis(REDIS_URL, {
-    maxRetriesPerRequest: null,
-    tls: {
-      rejectUnauthorized: false,
-    },
-  });
+// 🔐 Redis connection helper - checks if TLS is needed based on URL
+function createRedisConnection() {
+  // If URL starts with rediss:// (note the double 's'), use TLS
+  // Otherwise, don't force TLS
+  const useTLS = REDIS_URL.startsWith('rediss://');
+  
+  if (useTLS) {
+    return new IORedis(REDIS_URL, {
+      maxRetriesPerRequest: null,
+      tls: {
+        rejectUnauthorized: false,
+      },
+    });
+  } else {
+    // No TLS for regular redis:// URLs
+    return new IORedis(REDIS_URL, {
+      maxRetriesPerRequest: null,
+    });
+  }
 }
 
 // Main connection (used by queue)
-const connection = redisTLS();
+const connection = createRedisConnection();
 
 // Queue
 export const orderQueue = new Queue<{ orderId: string }>('order-execution', {
@@ -40,9 +51,9 @@ export const orderQueue = new Queue<{ orderId: string }>('order-execution', {
 });
 
 // Publisher for WebSocket messages
-const publisher = redisTLS();
+const publisher = createRedisConnection();
 
-// Worker — THIS IS WHERE THE BUG WAS
+// Worker
 export const orderWorker = new Worker<{ orderId: string }>(
   'order-execution',
   async (job: Job<{ orderId: string }>) => {
@@ -179,15 +190,15 @@ export const orderWorker = new Worker<{ orderId: string }>(
     }
   },
   {
-    // FIX: Worker MUST use TLS Redis client
-    connection: redisTLS(),
+    // Worker uses same connection logic
+    connection: createRedisConnection(),
     concurrency: parseInt(process.env.BULL_CONCURRENCY || '10', 10),
   }
 );
 
-// Events — must ALSO use TLS redis
+// Events
 export const orderEvents = new QueueEvents('order-execution', {
-  connection: redisTLS(),
+  connection: createRedisConnection(),
 });
 
 export async function publishOrderUpdate(message: OrderUpdateMessage) {

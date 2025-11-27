@@ -6,6 +6,26 @@ import { OrderUpdateMessage } from '../models/order';
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
 /**
+ * Create Redis connection - only use TLS if URL starts with rediss://
+ */
+function createRedisConnection() {
+  const useTLS = REDIS_URL.startsWith('rediss://');
+  
+  if (useTLS) {
+    return new IORedis(REDIS_URL, {
+      maxRetriesPerRequest: null,
+      tls: {
+        rejectUnauthorized: false,
+      },
+    });
+  } else {
+    return new IORedis(REDIS_URL, {
+      maxRetriesPerRequest: null,
+    });
+  }
+}
+
+/**
  * Handle WebSocket connection for order updates
  */
 export async function handleOrderWebSocket(
@@ -16,10 +36,7 @@ export async function handleOrderWebSocket(
   logger.info('WebSocket connection opened', { orderId });
 
   // Subscribe to Redis pub/sub for this order
-  const subscriber = new IORedis(REDIS_URL, {
-    maxRetriesPerRequest: null,
-    tls: { rejectUnauthorized: false }
-  });
+  const subscriber = createRedisConnection();
 
   await subscriber.subscribe(`order:${orderId}`);
 
@@ -59,4 +76,3 @@ export async function handleOrderWebSocket(
     })
   );
 }
-
