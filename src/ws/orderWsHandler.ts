@@ -18,6 +18,7 @@ export async function handleOrderWebSocket(
   // Subscribe to Redis pub/sub for this order
   const subscriber = new IORedis(REDIS_URL, {
     maxRetriesPerRequest: null,
+    tls: { rejectUnauthorized: false }
   });
 
   await subscriber.subscribe(`order:${orderId}`);

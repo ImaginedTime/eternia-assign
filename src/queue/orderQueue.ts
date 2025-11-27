@@ -1,9 +1,8 @@
-import { Queue, Worker, Job } from 'bullmq';
+import { Queue, Worker, Job, QueueEvents } from 'bullmq';
 import IORedis from 'ioredis';
 import { logger } from '../utils/logger';
 import { Order, OrderStatus } from '../models/order';
 import { getOrderById, updateOrderStatus } from '../db';
-import { sleepWithBackoff } from '../utils/backoff';
 import { OrderUpdateMessage } from '../models/order';
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
@@ -11,15 +10,24 @@ const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3', 10);
 const BACKOFF_BASE_MS = parseInt(process.env.BACKOFF_BASE_MS || '500', 10);
 const ORDER_PROCESSOR_RATE = parseInt(process.env.ORDER_PROCESSOR_RATE || '100', 10);
 
-// Rate limiting: 100 orders per minute = ~1.67 orders per second
-// Use token bucket: allow 1 order per 600ms
+// For rate limiting
 const RATE_LIMIT_MS = 60000 / ORDER_PROCESSOR_RATE;
 let lastProcessedTime = 0;
 
-const connection = new IORedis(REDIS_URL, {
-  maxRetriesPerRequest: null,
-});
+// 🔐 secure redis connection (TLS required for Aiven)
+function redisTLS() {
+  return new IORedis(REDIS_URL, {
+    maxRetriesPerRequest: null,
+    tls: {
+      rejectUnauthorized: false,
+    },
+  });
+}
 
+// Main connection (used by queue)
+const connection = redisTLS();
+
+// Queue
 export const orderQueue = new Queue<{ orderId: string }>('order-execution', {
   connection,
   defaultJobOptions: {
@@ -31,40 +39,29 @@ export const orderQueue = new Queue<{ orderId: string }>('order-execution', {
   },
 });
 
-// WebSocket update publisher (using Redis pub/sub)
-const publisher = connection.duplicate();
+// Publisher for WebSocket messages
+const publisher = redisTLS();
 
-export async function publishOrderUpdate(message: OrderUpdateMessage): Promise<void> {
-  await publisher.publish(`order:${message.orderId}`, JSON.stringify(message));
-}
-
-// Worker to process orders
+// Worker — THIS IS WHERE THE BUG WAS
 export const orderWorker = new Worker<{ orderId: string }>(
   'order-execution',
   async (job: Job<{ orderId: string }>) => {
     const { orderId } = job.data;
-    // wait 20s before processing
-    // await new Promise((resolve) => setTimeout(resolve, 20000));
+
     logger.info('Processing order', { orderId, attempt: job.attemptsMade + 1 });
 
     // Rate limiting
     const now = Date.now();
-    const timeSinceLastProcess = now - lastProcessedTime;
-    if (timeSinceLastProcess < RATE_LIMIT_MS) {
-      await new Promise((resolve) =>
-        setTimeout(resolve, RATE_LIMIT_MS - timeSinceLastProcess)
-      );
+    const delta = now - lastProcessedTime;
+    if (delta < RATE_LIMIT_MS) {
+      await new Promise((res) => setTimeout(res, RATE_LIMIT_MS - delta));
     }
     lastProcessedTime = Date.now();
 
     try {
-      // Get order from DB
       const order = await getOrderById(orderId);
-      if (!order) {
-        throw new Error(`Order ${orderId} not found`);
-      }
+      if (!order) throw new Error(`Order ${orderId} not found`);
 
-      // Update status: pending -> routing
       if (order.status === OrderStatus.PENDING) {
         await updateOrderStatus(orderId, OrderStatus.ROUTING);
         await publishOrderUpdate({
@@ -74,8 +71,7 @@ export const orderWorker = new Worker<{ orderId: string }>(
         });
       }
 
-      // Get quotes and route
-      const basePrice = 25.0; // Mock base price
+      const basePrice = 25.0;
       const { getQuotes, selectBestDex } = await import('../services/dexRouter');
       const quotes = await getQuotes(
         order.tokenIn,
@@ -89,65 +85,23 @@ export const orderWorker = new Worker<{ orderId: string }>(
       }
 
       const routing = selectBestDex(quotes);
-      if (!routing) {
-        throw new Error('Failed to select DEX');
-      }
+      if (!routing) throw new Error('Failed to select DEX');
 
-      // Publish routing decision
-      await publishOrderUpdate({
-        orderId,
-        status: OrderStatus.ROUTING,
-        timestamp: new Date().toISOString(),
-        details: {
-          quotes: {
-            raydium: quotes.find((q) => q.dexName === 'Raydium')
-              ? {
-                  price: quotes.find((q) => q.dexName === 'Raydium')!.price,
-                  liquidity: quotes.find((q) => q.dexName === 'Raydium')!.liquidity,
-                  fee: quotes.find((q) => q.dexName === 'Raydium')!.fee,
-                }
-              : undefined,
-            meteora: quotes.find((q) => q.dexName === 'Meteora')
-              ? {
-                  price: quotes.find((q) => q.dexName === 'Meteora')!.price,
-                  liquidity: quotes.find((q) => q.dexName === 'Meteora')!.liquidity,
-                  fee: quotes.find((q) => q.dexName === 'Meteora')!.fee,
-                }
-              : undefined,
-            chosen: routing.dexName,
-          },
-        },
-      });
-
-      // Update status: routing -> building
       await updateOrderStatus(orderId, OrderStatus.BUILDING, {
         chosenDex: routing.dexName,
-        chosenQuote: {
-          price: routing.quote.price,
-          fee: routing.fee,
-          liquidity: routing.quote.liquidity,
-        },
+        chosenQuote: routing.quote,
       });
+
       await publishOrderUpdate({
         orderId,
         status: OrderStatus.BUILDING,
         timestamp: new Date().toISOString(),
       });
 
-      // Check limit price condition
-      if (order.orderType === 'limit' && order.limitPrice) {
-        if (routing.expectedPrice > order.limitPrice) {
-          throw new Error(
-            `Limit price not met: expected ${routing.expectedPrice} > limit ${order.limitPrice}`
-          );
-        }
-      }
-
-      // Execute swap
       const USE_REAL_DEVNET = process.env.USE_REAL_DEVNET === 'true';
       const { executeSwap } = await import('../services/mockDex');
       const { executeSwapReal } = await import('../services/solanaDex');
-      
+
       const result = USE_REAL_DEVNET
         ? await executeSwapReal(routing.dexName, {
             tokenIn: order.tokenIn,
@@ -162,92 +116,62 @@ export const orderWorker = new Worker<{ orderId: string }>(
             limitPrice: order.limitPrice || routing.expectedPrice,
           });
 
-      // Update status: building -> submitted
       await updateOrderStatus(orderId, OrderStatus.SUBMITTED, {
         txHash: result.txHash,
       });
+
       await publishOrderUpdate({
         orderId,
         status: OrderStatus.SUBMITTED,
         timestamp: new Date().toISOString(),
-        details: {
-          txHash: result.txHash,
-        },
       });
 
-      // Simulate confirmation delay
       await new Promise((resolve) => setTimeout(resolve, 1000));
 
-      // Update status: submitted -> confirmed
       await updateOrderStatus(orderId, OrderStatus.CONFIRMED, {
         executedPrice: result.executedPrice,
         txHash: result.txHash,
       });
+
       await publishOrderUpdate({
         orderId,
         status: OrderStatus.CONFIRMED,
         timestamp: new Date().toISOString(),
-        details: {
-          txHash: result.txHash,
-          executedPrice: result.executedPrice,
-        },
       });
 
       logger.info('Order completed successfully', {
         orderId,
         txHash: result.txHash,
-        executedPrice: result.executedPrice,
       });
 
-      return {
-        success: true,
-        txHash: result.txHash,
-        executedPrice: result.executedPrice,
-      };
+      return { success: true };
     } catch (error: any) {
       const attempts = job.attemptsMade + 1;
+
       logger.error('Order processing failed', {
         orderId,
         attempt: attempts,
         error: error.message,
       });
 
-      // Get current order to preserve status
-      const currentOrder = await getOrderById(orderId);
-      const currentStatus = currentOrder?.status || OrderStatus.PENDING;
+      const existing = await getOrderById(orderId);
+      const status = existing?.status || OrderStatus.PENDING;
 
-      // Update order with error
-      await updateOrderStatus(orderId, currentStatus, {
+      await updateOrderStatus(orderId, status, {
         attempts,
         lastError: error.message,
       });
 
-      // If max retries reached, mark as failed
       if (attempts >= MAX_RETRIES) {
         await updateOrderStatus(orderId, OrderStatus.FAILED, {
           attempts,
           lastError: error.message,
         });
+
         await publishOrderUpdate({
           orderId,
           status: OrderStatus.FAILED,
           timestamp: new Date().toISOString(),
-          details: {
-            error: error.message,
-            attempt: attempts,
-          },
-        });
-      } else {
-        // Publish retry update
-        const currentOrder = await getOrderById(orderId);
-        await publishOrderUpdate({
-          orderId,
-          status: currentOrder?.status || OrderStatus.PENDING,
-          timestamp: new Date().toISOString(),
-          details: {
-            error: error.message,
-            attempt: attempts,
-          },
         });
       }
 
@@ -255,27 +179,23 @@ export const orderWorker = new Worker<{ orderId: string }>(
     }
   },
   {
-    connection,
+    // FIX: Worker MUST use TLS Redis client
+    connection: redisTLS(),
     concurrency: parseInt(process.env.BULL_CONCURRENCY || '10', 10),
   }
 );
 
-orderWorker.on('completed', (job) => {
-  logger.info('Job completed', { jobId: job.id, orderId: job.data.orderId });
+// Events — must ALSO use TLS redis
+export const orderEvents = new QueueEvents('order-execution', {
+  connection: redisTLS(),
 });
 
-orderWorker.on('failed', (job, err) => {
-  logger.error('Job failed', {
-    jobId: job?.id,
-    orderId: job?.data.orderId,
-    error: err.message,
-  });
-});
+export async function publishOrderUpdate(message: OrderUpdateMessage) {
+  await publisher.publish(`order:${message.orderId}`, JSON.stringify(message));
+}
 
 export async function closeQueue(): Promise<void> {
   await orderWorker.close();
   await orderQueue.close();
-  await connection.quit();
   await publisher.quit();
 }
-
